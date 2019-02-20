@@ -193,7 +193,7 @@ import qualified Data.Some as Some
 import Data.String
 import Data.These
 import Data.Type.Coercion
-import Reflex.FunctorMaybe
+import Data.FunctorMaybe
 import Reflex.Patch
 import qualified Reflex.Patch.MapWithMove as PatchMapWithMove
 
@@ -232,7 +232,7 @@ class ( MonadHold t (PushM t)
   type PushM t :: * -> *
   -- | A monad for doing complex pull-based calculations efficiently
   type PullM t :: * -> *
-  -- | An 'Event' with no occurrences
+--  -- | An 'Event' with no occurrences
   never :: Event t a
   -- | Create a 'Behavior' that always has the given value
   constant :: a -> Behavior t a --TODO: Refactor to use 'pure' from Applicative instead; however, we need to make sure that encouraging Applicative-style use of 'Behavior's doesn't have a negative performance impact

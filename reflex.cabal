@@ -71,6 +71,7 @@ library
     Data.FastMutableIntMap,
     Data.FastWeakBag,
     Data.Functor.Misc,
+    Data.FunctorMaybe,
     Data.Map.Misc,
     Data.WeakBag,
     Reflex,
@@ -88,7 +89,6 @@ library
     Reflex.EventWriter.Base,
     Reflex.EventWriter.Class,
     Reflex.FastWeak,
-    Reflex.FunctorMaybe,
     Reflex.Host.Class,
     Reflex.Network,
     Reflex.NotReady.Class,
@@ -103,8 +103,8 @@ library
     Reflex.PerformEvent.Class,
     Reflex.PostBuild.Base,
     Reflex.PostBuild.Class,
-    Reflex.Profiled,
-    Reflex.Pure,
+--    Reflex.Profiled,
+--    Reflex.Pure,
     Reflex.Query.Base,
     Reflex.Query.Class,
     Reflex.Requester.Base,
@@ -114,8 +114,8 @@ library
     Reflex.Time,
     Reflex.TriggerEvent.Base,
     Reflex.TriggerEvent.Class,
-    Reflex.Widget.Basic,
-    Reflex.Workflow
+    Reflex.Widget.Basic
+--    Reflex.Workflow
 
   ghc-options: -Wall -fwarn-redundant-constraints -fwarn-tabs -funbox-strict-fields -O2 -fspecialise-aggressively
 

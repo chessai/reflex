@@ -1,6 +1,6 @@
 -- | This module defines the FunctorMaybe class, which extends Functors with the
 -- ability to delete values.
-module Reflex.FunctorMaybe
+module Data.FunctorMaybe
   ( FunctorMaybe (..)
   ) where
 
