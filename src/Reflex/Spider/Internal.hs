@@ -26,6 +26,12 @@ module Reflex.Spider.Internal
   ( module Reflex.Spider.Internal
   ) where
 
+import Data.Functor.Plus
+import Data.List.NonEmpty (NonEmpty(..))
+import Data.Semigroup (Semigroup(..))
+import Data.Functor.Bind (Bind((>>-),join))
+import Data.Functor.Apply (Apply((<.>)))
+import Data.Default (Default(def))
 import Control.Applicative (liftA2)
 import Control.Monad.Trans.Except (ExceptT)
 import Control.Monad.Reader (ReaderT)
@@ -35,6 +41,7 @@ import Control.Monad.Trans.RWS (RWST)
 import Control.Monad.Trans.Writer (WriterT)
 import Control.Concurrent
 import Control.Exception
+import qualified Control.Monad
 import Control.Monad hiding (forM, forM_, mapM, mapM_)
 import Control.Monad.Exception
 import Control.Monad.Identity hiding (forM, forM_, mapM, mapM_)
@@ -237,7 +244,7 @@ pushCheap' :: (a -> EventM (Maybe b)) -> Event a -> Event b
 pushCheap' f e = Event $ \sub -> do
   (subscription, occ) <- subscribeAndRead e $ sub
     { subscriberPropagate = \a -> f a >>= mapM_ (subscriberPropagate sub) }
-  occ' <- join <$> mapM f occ
+  occ' <- Control.Monad.join <$> mapM f occ
   pure (subscription, occ')
 
 {-# inline terminalSubscriber #-}
@@ -1191,9 +1198,6 @@ newInvalidatorSwitch subd = return $! InvalidatorSwitch subd
 newInvalidatorPull :: Pull a -> IO Invalidator
 newInvalidatorPull p = return $! InvalidatorPull p
 
-instance FunctorMaybe Event where
-  fmapMaybe f = push $ return . f
-
 instance Align Event where
   nil = never
   align :: Event a -> Event b -> Event (These a b)
@@ -1208,6 +1212,9 @@ newtype Dyn p = Dyn { unDyn :: IORef (DynType p) }
 
 newMapDyn :: (a -> b) -> Dynamic' (Identity a) -> Dynamic' (Identity b)
 newMapDyn f d = dynamicDynIdentity' $ unsafeBuildDynamic' (fmap f $ readBehaviorTracked $ dynamicCurrent d) (Identity . f . runIdentity <$> dynamicUpdated d)
+
+zipDyn :: Dynamic a -> Dynamic b -> Dynamic (a, b)
+zipDyn = zipDynWith (,)
 
 {-# inline zipDynWith #-}
 zipDynWith :: (a -> b -> c) -> Dynamic a -> Dynamic b -> Dynamic c
@@ -1250,10 +1257,52 @@ unsafeNewIORef a b = unsafePerformIO $ do
   newIORef b
 
 instance Functor Event where
-  fmap f = push' $ return . Just . f
+  fmap f = fmapMaybe $ Just . f
+  x <$ e = fmapCheap (const x) e
 
-instance Functor (Behavior) where
+instance Alt Event where
+  ev1 <!> ev2 = leftmost [ev1,ev2]
+
+instance Apply Event where
+  evf <.> evx = coincidence (fmap (<$> evx) evf)
+
+instance Bind Event where
+  evx >>- f = coincidence (f <$> evx)
+  join = coincidence
+
+instance FunctorMaybe Event where
+  fmapMaybe f = push $ pure . f
+
+instance Plus Event where
+  zero = never
+
+instance Functor Behavior where
   fmap f = pull' . fmap f . readBehaviorTracked
+
+instance Semigroup a => Semigroup (Event a) where
+  (<>) = alignWith (mergeThese (<>))
+  sconcat = fmap sconcat . mergeList . Data.Foldable.toList
+  stimes n = fmap $ stimes n
+
+instance Semigroup a => Monoid (Event a) where
+  mempty = never
+  mappend = (<>)
+  mconcat = fmap sconcat . mergeList
+ 
+tag :: Behavior b -> Event a -> Event b
+tag b = pushAlways $ const (sample b)
+
+tagMaybe :: Behavior (Maybe b) -> Event a -> Event b
+tagMaybe b = push (const (sample b))
+
+attach :: Behavior a -> Event b -> Event (a,b)
+attach = attachWith (,)
+
+attachWith :: (a -> b -> c) -> Behavior a -> Event b -> Event c
+attachWith f = attachWithMaybe $ \a b -> Just $ f a b
+
+attachWithMaybe :: (a -> b -> Maybe c) -> Behavior a -> Event b -> Event c
+attachWithMaybe f b e = flip push e $ \o -> (`f` o) <$> sample b
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
 run :: forall b. [DSum RootTrigger Identity] -> ResultM b -> SpiderHost b
@@ -1934,8 +1983,8 @@ mergeCheap' getInitialSubscribers updateFunc destroy d = Event $ \sub -> do
          , occ
          )
 
-mergeInt :: forall a. Dynamic' (PatchIntMap (Event a)) -> Event (IntMap a)
-mergeInt = cacheEvent . mergeIntCheap
+mergeInt' :: forall a. Dynamic' (PatchIntMap (Event a)) -> Event (IntMap a)
+mergeInt' = cacheEvent . mergeIntCheap
 
 {-# INLINABLE mergeIntCheap #-}
 mergeIntCheap :: forall a. Dynamic' (PatchIntMap (Event a)) -> Event (IntMap a)
@@ -2454,6 +2503,15 @@ newJoinDyn d =
   in unsafeBuildDynamic readV0 v'
 -}
 
+instance Semigroup a => Semigroup (Dynamic a) where
+  (<>) = zipDynWith (<>)
+  stimes n = fmap $ stimes n
+
+instance Monoid a => Monoid (Dynamic a) where
+  mempty = constDyn mempty
+  mappend = zipDynWith mappend
+-- mconcat = distributeListOverDynWith mconcat
+
 instance Functor Dynamic where
   fmap = mapDynamic
   {-# inline fmap #-} 
@@ -2462,6 +2520,8 @@ instance Functor Dynamic where
 mapDynamic :: (a -> b) -> Dynamic a -> Dynamic b
 mapDynamic f = Dynamic . newMapDyn f . unDynamic
 {-# inline [1] mapDynamic #-}
+
+{-# RULES "mapDynamic/coerce" [1] mapDynamic coerce = coerce #-}
 
 instance Applicative Dynamic where
   pure = Dynamic . dynamicConst'
@@ -2537,10 +2597,6 @@ instance Reflex.Class.MonadHold (SpiderTimeline x) (Reflex.Spider.Internal.ReadP
 --------------------------------------------------------------------------------
 -- Deprecated items
 --------------------------------------------------------------------------------
-
--- | 'SpiderEnv' is the old name for 'SpiderTimeline'
-{-# DEPRECATED SpiderEnv "Use 'SpiderTimelineEnv' instead" #-}
-type SpiderEnv = SpiderTimeline
 
 {-
 instance Reflex.Host.Class.MonadSubscribeEvent (SpiderTimeline x) (SpiderHostFrame x) where
@@ -2715,8 +2771,17 @@ eventCoercion Coercion = Coercion
 dynamicCoercion :: Coercion a b -> Coercion (Dynamic a) (Dynamic b)
 dynamicCoercion = unsafeCoerce
 
+coerceBehavior :: Coercible a b => Behavior a -> Behavior b
+coerceBehavior = coerceWith $ behaviorCoercion Coercion
+
+coerceEvent :: Coercible a b => Event a -> Event b
+coerceEvent = coerceWith $ eventCoercion Coercion
+
+coerceDynamic :: Coercible a b => Dynamic a -> Dynamic b
+coerceDynamic = coerceWith $ dynamicCoercion Coercion
+
 mergeIntIncremental :: Incremental (PatchIntMap (Event a)) -> Event (IntMap a)
-mergeIntIncremental = mergeInt . unIncremental
+mergeIntIncremental = mergeInt' . unIncremental
 
 fanInt :: Event (IntMap a) -> EventSelectorInt a
 fanInt p =
@@ -2925,3 +2990,77 @@ instance MonadAtomicRef (SpiderHostFrame x) where
 instance PrimMonad (SpiderHostFrame x) where
   type PrimState (SpiderHostFrame x) = PrimState IO
   primitive = SpiderHostFrame . EventM . primitive
+
+
+constDyn :: a -> Dynamic a
+constDyn = pure
+
+unsafeDynamic :: Behavior a -> Event a -> Dynamic a
+unsafeDynamic = unsafeBuildDynamic . sample
+
+instance Default a => Default (Dynamic a) where
+  def = pure def
+
+pushAlways :: (a -> PushM b) -> Event a -> Event b
+pushAlways f = push (fmap Just . f)
+
+instance Applicative Behavior where
+  pure = constant
+  f <*> x = pull $ sample f `ap` sample x
+  _ *> b = b
+  a <* _ = a
+
+instance Apply Behavior where
+  (<.>) = (<*>)
+
+instance Bind Behavior where
+  (>>-) = (>>=)
+
+instance Monad Behavior where
+  return = pure
+  a >>= f = pull $ sample a >>= sample . f
+  -- N.B.: It is tempting to write (_ >> b = b; however, this would result in
+  -- (fail x >> return y) succeeding (returning y), which violates the law that
+  -- (a >> b = a >>= const b), since the implementation of (>>=) above actually will fail.
+  -- Since we can't examine 'Behavior's other than by using sample, I don't think it's
+  -- possible to write (>>) to be more efficient than the (>>=) above.
+
+instance Semigroup a => Semigroup (Behavior a) where
+  a <> b = pull $ liftA2 (<>) (sample a) (sample b)
+  sconcat = pull . fmap sconcat . mapM sample
+  stimes n = fmap $ stimes n
+
+instance Monoid a => Monoid (Behavior a) where
+  mempty = constant mempty
+  mappend = (<>)
+  mconcat = pull . fmap mconcat . mapM sample
+
+mergeInt :: IntMap (Event a) -> Event (IntMap a)
+mergeInt m = mergeIntIncremental $ unsafeBuildIncremental (pure m) never
+
+mergeWith' :: (a -> b) -> (b -> b -> b) -> [Event a] -> Event b
+mergeWith' f g es = fmap (foldl1 g . fmap f)
+  . mergeInt
+  . IntMap.fromDistinctAscList
+  $ zip [0 :: Int ..] es
+
+mergeWith :: (a -> a -> a) -> [Event a] -> Event a
+mergeWith = mergeWith' id
+
+leftmost :: [Event a] -> Event a
+leftmost = mergeWith const
+
+mergeList :: [Event a] -> Event (NonEmpty a)
+mergeList = \case
+  [] -> never
+  es -> mergeWithFoldCheap' id es
+
+mergeWithFoldCheap' :: (NonEmpty a -> b) -> [Event a] -> Event b
+mergeWithFoldCheap' f es =
+  fmapCheap (f . (\(h : t) -> h :| t) . IntMap.elems)
+  . mergeInt
+  . IntMap.fromDistinctAscList
+  $ zip [0 :: Int .. ] es
+
+fmapCheap :: (a -> b) -> Event a -> Event b
+fmapCheap f = pushCheap $ pure . Just . f

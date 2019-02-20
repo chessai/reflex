@@ -2,6 +2,9 @@
 -- ability to delete values.
 module Data.FunctorMaybe
   ( FunctorMaybe (..)
+  , ffilter
+  , filterLeft
+  , filterRight
   ) where
 
 import Data.IntMap (IntMap)
@@ -41,3 +44,13 @@ instance FunctorMaybe (Map k) where
 
 instance FunctorMaybe IntMap where
   fmapMaybe = IntMap.mapMaybe
+
+ffilter :: FunctorMaybe f => (a -> Bool) -> f a -> f a
+ffilter f = fmapMaybe $ \x -> if f x then Just x else Nothing
+
+filterLeft :: FunctorMaybe f => f (Either a b) -> f a
+filterLeft = fmapMaybe (either Just (const Nothing))
+
+filterRight :: FunctorMaybe f => f (Either a b) -> f b
+filterRight = fmapMaybe (either (const Nothing) Just)
+

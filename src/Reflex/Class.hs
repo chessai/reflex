@@ -144,21 +144,14 @@ module Reflex.Class
   , ffor2
   , ffor3
     -- * Deprecated functions
-  , appendEvents
-  , onceE
-  , sequenceThese
   , fmapMaybeCheap
   , fmapCheap
   , fforCheap
   , fforMaybeCheap
   , pushAlwaysCheap
   , tagCheap
-  , mergeWithCheap
-  , mergeWithCheap'
-  , switchPromptly
-  , switchPromptOnly
-    -- * Slow, but general, implementations
-  , slowHeadE
+--    -- * Slow, but general, implementations
+--  , slowHeadE
   ) where
 
 import Control.Applicative
@@ -391,11 +384,11 @@ mapAccumMaybeMIncremental f z e = do
       d' <- holdIncremental z $ fmapMaybe fst e'
   return (d', fmapMaybe snd e')
 
-slowHeadE :: (Reflex t, MonadHold t m, MonadFix m) => Event t a -> m (Event t a)
-slowHeadE e = do
-  rec be <- hold e $ fmapCheap (const never) e'
-      let e' = switch be
-  return e'
+--slowHeadE :: (Reflex t, MonadHold t m, MonadFix m) => Event t a -> m (Event t a)
+--slowHeadE e = do
+--  rec be <- hold e $ fmapCheap (const never) e'
+--      let e' = switch be
+--  return e'
 
 -- | An 'EventSelector' allows you to efficiently 'select' an 'Event' based on a
 -- key.  This is much more efficient than filtering for each key with
@@ -553,19 +546,6 @@ instance (Reflex t, Semigroup a) => Semigroup (Behavior t a) where
 -- | Flipped version of 'fmapMaybe'.
 fforMaybe :: FunctorMaybe f => f a -> (a -> Maybe b) -> f b
 fforMaybe = flip fmapMaybe
-
--- | Filter 'f a' using the provided predicate.
--- Relies on 'fforMaybe'.
-ffilter :: FunctorMaybe f => (a -> Bool) -> f a -> f a
-ffilter f = fmapMaybe $ \x -> if f x then Just x else Nothing
-
--- | Filter 'Left's from 'f (Either a b)' into 'a'.
-filterLeft :: FunctorMaybe f => f (Either a b) -> f a
-filterLeft = fmapMaybe (either Just (const Nothing))
-
--- | Filter 'Right's from 'f (Either a b)' into 'b'.
-filterRight :: FunctorMaybe f => f (Either a b) -> f b
-filterRight = fmapMaybe (either (const Nothing) Just)
 
 -- | Left-biased event union (prefers left event on simultaneous
 -- occurrence).
@@ -1308,14 +1288,6 @@ fmapCheap f = pushCheap $ return . Just . f
 tagCheap :: Reflex t => Behavior t b -> Event t a -> Event t b
 tagCheap b = pushAlwaysCheap $ \_ -> sample b
 
-{-# INLINE mergeWithCheap #-}
-mergeWithCheap :: Reflex t => (a -> a -> a) -> [Event t a] -> Event t a
-mergeWithCheap = mergeWithCheap' id
-
-{-# INLINE mergeWithCheap' #-}
-mergeWithCheap' :: Reflex t => (a -> b) -> (b -> b -> b) -> [Event t a] -> Event t b
-mergeWithCheap' f g = mergeWithFoldCheap' $ foldl1 g . fmap f
-
 {-# INLINE mergeWithFoldCheap' #-}
 mergeWithFoldCheap' :: Reflex t => (NonEmpty a -> b) -> [Event t a] -> Event t b
 mergeWithFoldCheap' f es =
@@ -1324,35 +1296,3 @@ mergeWithFoldCheap' f es =
   . IntMap.fromDistinctAscList
   $ zip [0 :: Int ..] es
 
---------------------------------------------------------------------------------
--- Deprecated functions
---------------------------------------------------------------------------------
-
--- | Create a new 'Event' that occurs if at least one of the supplied 'Event's
--- occurs. If both occur at the same time they are combined using 'mappend'.
-{-# DEPRECATED appendEvents "If a 'Semigroup a' instance is available, use 'mappend'; otherwise, use 'alignWith (mergeThese mappend)' instead" #-}
-appendEvents :: (Reflex t, Monoid a) => Event t a -> Event t a -> Event t a
-appendEvents = alignWith $ mergeThese mappend
-
--- | Alias for 'headE'
-{-# DEPRECATED onceE "Use 'headE' instead" #-}
-onceE :: MonadHold t m => Event t a -> m (Event t a)
-onceE = headE
-
--- | Run both sides of a 'These' monadically, combining the results.
-{-# DEPRECATED sequenceThese "Use bisequenceA or bisequence from the bifunctors package instead" #-}
-#ifdef USE_TEMPLATE_HASKELL
-{-# ANN sequenceThese "HLint: ignore Use fmap" #-}
-#endif
-sequenceThese :: Monad m => These (m a) (m b) -> m (These a b)
-sequenceThese t = case t of
-  This ma -> fmap This ma
-  These ma mb -> liftM2 These ma mb
-  That mb -> fmap That mb
-
-{-# DEPRECATED switchPromptly "Use 'switchHoldPromptly' instead. The 'switchHold*' naming convention was chosen because those functions are more closely related to each other than they are to 'switch'. " #-}
-switchPromptly :: (Reflex t, MonadHold t m) => Event t a -> Event t (Event t a) -> m (Event t a)
-switchPromptly = switchHoldPromptly
-{-# DEPRECATED switchPromptOnly "Use 'switchHoldPromptOnly' instead. The 'switchHold*' naming convention was chosen because those functions are more closely related to each other than they are to 'switch'. " #-}
-switchPromptOnly :: (Reflex t, MonadHold t m) => Event t a -> Event t (Event t a) -> m (Event t a)
-switchPromptOnly = switchHoldPromptOnly
