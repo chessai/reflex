@@ -25,6 +25,7 @@ module Reflex.Spider.Internal
   , PullM(..)
   , PushM(..)
   , EventM(..)
+
     -- ** Primitive functions
   , never
   , constant
@@ -166,7 +167,26 @@ module Reflex.Spider.Internal
 
     -- * FunctorMaybe
   , FunctorMaybe(..)
-  , 
+
+    -- * 'UniqDynamic'
+  , UniqDynamic(..)
+  , alreadyUniqDynamic
+
+    -- * Spider
+  , SpiderHost(..)
+  , SpiderHostFrame(..)
+  , MonadSubscribeEvent(..)
+  , MonadReflexCreateTrigger(..)
+  , MonadReflexHost(..)
+  , fireEvents
+  , newEventWithTriggerRef
+  , fireEventRef
+  , fireEventRefAndRead
+
+  , SpiderTimelineEnv(..)
+  , newSpiderTimeline
+  , runSpiderHost
+  , runSpiderHostForTimeline
   ) where
 
 import Control.Applicative (liftA2)
@@ -180,7 +200,7 @@ import Control.Monad.Identity (Identity(..))
 import Control.Monad.Primitive (touch)
 import Control.Monad.Reader (ReaderT(..),runReaderT,asks,ask)
 import Control.Monad.Ref
-import Control.Monad.State.Strict (StateT)
+import Control.Monad.State (StateT)
 import Control.Monad.Trans (MonadTrans(lift))
 import Control.Monad.Trans.Cont (ContT)
 import Control.Monad.Trans.Except (ExceptT)
@@ -229,6 +249,7 @@ import Reflex.Patch (Patch(..),PatchDMap(..),PatchDMapWithMove,unPatchDMapWithMo
 import System.IO.Unsafe (unsafePerformIO,unsafeInterleaveIO)
 import System.Mem.Weak (Weak,mkWeakPtr,finalize,deRefWeak)
 import Unsafe.Coerce (unsafeCoerce)
+import qualified Control.Monad.Trans.State.Strict as StrictStateT
 import qualified Control.Monad
 import qualified Data.Dependent.Map as DMap
 import qualified Data.FastMutableIntMap as FastMutableIntMap
@@ -425,6 +446,7 @@ pushCheap' f e = Event $ \sub -> do
   occ' <- Control.Monad.join <$> mapM f occ
   pure (subscription, occ')
 
+{-
 {-# inline terminalSubscriber #-}
 -- | A subscriber that never triggers other 'Event's
 terminalSubscriber :: (a -> EventM ()) -> Subscriber a
@@ -450,13 +472,6 @@ subscribeAndReadHead e sub = do
     Just _ -> unsubscribe subscription
   pure (subscription, occ)
 
-{-# RULES
-"cacheEvent/cacheEvent" forall e. cacheEvent (cacheEvent e) = cacheEvent e
-"cacheEvent/pushCheap'" forall f e. pushCheap' f (cacheEvent e) = cacheEvent (pushCheap' f e)
-"hold/cacheEvent" forall f e. hold f (cacheEvent e) = hold f e
-   #-}
-
-{-
 --TODO: Make this lazy in its input event
 headE' :: (MonadIO m) => Defer SomeMergeInit m -> Event a -> m (Event a)
 headE' d originalE = do
@@ -470,6 +485,12 @@ headE' d originalE = do
       Nothing -> return (EventSubscription (return ()) $ EventSubscribed zeroRef $ toAny (), Nothing)
       Just e -> subscribeAndReadHead e sub
 -}
+
+{-# RULES
+"cacheEvent/cacheEvent" forall e. cacheEvent (cacheEvent e) = cacheEvent e
+"cacheEvent/pushCheap'" forall f e. pushCheap' f (cacheEvent e) = cacheEvent (pushCheap' f e)
+"hold/cacheEvent" forall f e. hold f (cacheEvent e) = hold f e
+   #-}
 
 data CacheSubscribed a
    = CacheSubscribed { _cacheSubscribed_subscribers :: {-# UNPACK #-} !(FastWeakBag (Subscriber a))
@@ -1080,8 +1101,8 @@ deferSomeResetCoincidenceEventM = Defer (asksEventEnv eventEnvResetCoincidences)
 holdE :: Patch p => PatchTarget p -> Event p -> EventM (Hold p)
 holdE v0 e = hold' deferSomeHoldInitEventM v0 e
 
-holdB :: Patch p => PatchTarget p -> Event p -> BehaviorM (Hold p)
-holdB v0 e = hold' deferSomeHoldInitBehaviorM v0 e
+--holdB :: Patch p => PatchTarget p -> Event p -> BehaviorM (Hold p)
+--holdB v0 e = hold' deferSomeHoldInitBehaviorM v0 e
  
 -- Note: hold cannot examine its event until after the phase is over
 {-# inline [1] hold' #-}
@@ -1188,7 +1209,7 @@ data RootSubscribed a = forall k. GCompare k => RootSubscribed
 data Root (k :: * -> *)
    = Root { rootOccurrence :: !(IORef (DMap k Identity)) -- The currently-firing occurrence of this event
           , rootSubscribed :: !(IORef (DMap k RootSubscribed))
-          , rootInit :: !(forall a. k a -> RootTrigger a -> IO (IO ()))
+          , rootInit :: !(forall a. k a -> EventTrigger a -> IO (IO ()))
           }
 
 data SomeHoldInit = forall p. Patch p => SomeHoldInit !(Hold p)
@@ -1395,12 +1416,12 @@ attachWithMaybe :: (a -> b -> Maybe c) -> Behavior a -> Event b -> Event c
 attachWithMaybe f b e = flip push e $ \o -> (`f` o) <$> sample b
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
-run :: forall b. [DSum RootTrigger Identity] -> EventM b -> SpiderHost b
+run :: forall b. [DSum EventTrigger Identity] -> EventM b -> SpiderHost b
 run roots after = do
   tracePropagate (Proxy :: Proxy x) $ "Running an event frame with " <> show (length roots) <> " events"
   let t = spiderTimeline :: SpiderTimelineEnv x
   result <- SpiderHost $ withMVar (_spiderTimeline_lock t) $ \_ -> unSpiderHost $ runFrame $ do
-    rootsToPropagate <- forM roots $ \r@(RootTrigger (_, occRef, k) :=> a) -> do
+    rootsToPropagate <- forM roots $ \r@(EventTrigger (_, occRef, k) :=> a) -> do
       occBefore <- liftIO $ do
         occBefore <- readIORef occRef
         writeIORef occRef $! DMap.insert k a occBefore
@@ -1409,7 +1430,7 @@ run roots after = do
         then do scheduleRootClear occRef
                 return $ Just r
         else return Nothing
-    forM_ (catMaybes rootsToPropagate) $ \(RootTrigger (subscribersRef, _, _) :=> Identity a) -> do
+    forM_ (catMaybes rootsToPropagate) $ \(EventTrigger (subscribersRef, _, _) :=> Identity a) -> do
       propagate a subscribersRef
     delayedRef <- asksEventEnv eventEnvDelayedMerges
     let go = do
@@ -1598,7 +1619,7 @@ getRootSubscribed k r sub = do
       uninitRef <- newIORef $ error "getRootsubscribed: uninitRef not initialized"
       (subs, sln) <- WeakBag.singleton sub weakSelf cleanupRootSubscribed
       when debugPropagate $ putStrLn $ "getRootSubscribed: calling rootInit"
-      uninit <- rootInit r k $ RootTrigger (subs, rootOccurrence r, k)
+      uninit <- rootInit r k $ EventTrigger (subs, rootOccurrence r, k)
       writeIORef uninitRef $! uninit
       let !subscribed = RootSubscribed
             { rootSubscribedKey = k
@@ -2042,12 +2063,12 @@ mergeCheap' getInitialSubscribers updateFunc destroy d = Event $ \sub -> do
                  then invalidHeight
                  else succHeight $ heightBagMax myHeightBag
   currentHeight <- getCurrentHeight
-  let (occ, accum) = if currentHeight >= myHeight -- If we should have fired by now
+  let (occ, accum') = if currentHeight >= myHeight -- If we should have fired by now
                      then (if DMap.null dm then Nothing else Just dm, DMap.empty)
                      else (Nothing, dm)
-  unless (DMap.null accum) $ do
+  unless (DMap.null accum') $ do
     scheduleMergeSelf m myHeight
-  liftIO $ writeIORef accumRef $! accum
+  liftIO $ writeIORef accumRef $! accum'
   liftIO $ writeIORef heightRef $! myHeight
   liftIO $ writeIORef heightBagRef $! myHeightBag
   changeSubdRef <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
@@ -2078,14 +2099,14 @@ mergeInt' = cacheEvent . mergeIntCheap
 mergeIntCheap :: forall a. Dynamic' (PatchIntMap (Event a)) -> Event (IntMap a)
 mergeIntCheap d = Event $ \sub -> do
   initialParents <- readBehaviorUntrackedE $ dynamicCurrent d
-  accum <- liftIO $ FastMutableIntMap.newEmpty
+  accum' <- liftIO $ FastMutableIntMap.newEmpty
   heightRef <- liftIO $ newIORef zeroHeight
   heightBagRef <- liftIO $ newIORef heightBagEmpty
   parents <- liftIO $ FastMutableIntMap.newEmpty
   let scheduleSelf = do
         height <- liftIO $ readIORef $ heightRef
         scheduleMerge' height heightRef $ do
-          vals <- liftIO $ FastMutableIntMap.getFrozenAndClear accum
+          vals <- liftIO $ FastMutableIntMap.getFrozenAndClear accum'
           subscriberPropagate sub vals
       invalidateMyHeight = do
         invalidateMergeHeight' heightRef sub
@@ -2104,8 +2125,8 @@ mergeIntCheap d = Event $ \sub -> do
             GT -> error $ "revalidateMergeHeight: more heights (" <> show (heightBagSize heights) <> ") than parents (" <> show numParents <> ") for Merge"
       mySubscriber k = Subscriber
         { subscriberPropagate = \a -> do
-            wasEmpty <- liftIO $ FastMutableIntMap.isEmpty accum
-            liftIO $ FastMutableIntMap.insert accum k a
+            wasEmpty <- liftIO $ FastMutableIntMap.isEmpty accum'
+            liftIO $ FastMutableIntMap.insert accum' k a
             when wasEmpty scheduleSelf
         , subscriberInvalidateHeight = \old -> do
             modifyIORef' heightBagRef $ heightBagRemove old
@@ -2117,7 +2138,7 @@ mergeIntCheap d = Event $ \sub -> do
   forM_ (IntMap.toList initialParents) $ \(k, p) -> do
     (subscription@(EventSubscription _ parentSubd), parentOcc) <- subscribeAndRead p $ mySubscriber k
     liftIO $ do
-      forM_ parentOcc $ FastMutableIntMap.insert accum k
+      forM_ parentOcc $ FastMutableIntMap.insert accum' k
       FastMutableIntMap.insert parents k subscription
       height <- getEventSubscribedHeight parentSubd
       if height == invalidHeight
@@ -2130,11 +2151,11 @@ mergeIntCheap d = Event $ \sub -> do
             else max (succHeight height) oldHeight
   myHeight <- liftIO $ readIORef heightRef
   currentHeight <- getCurrentHeight
-  isEmpty <- liftIO $ FastMutableIntMap.isEmpty accum
+  isEmpty <- liftIO $ FastMutableIntMap.isEmpty accum'
   occ <- if currentHeight >= myHeight -- If we should have fired by now
     then if isEmpty
          then return Nothing
-         else liftIO $ Just <$> FastMutableIntMap.getFrozenAndClear accum
+         else liftIO $ Just <$> FastMutableIntMap.getFrozenAndClear accum'
     else do when (not isEmpty) scheduleSelf -- We have things accumulated, but we shouldn't have fired them yet
             return Nothing
   changeSubdRef <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
@@ -2762,11 +2783,11 @@ pull' a = behaviorPull $ Pull
 
 newtype EventSelector k = EventSelector { select :: forall x. k x -> Event x }
 
-data RootTrigger a = forall k. GCompare k => RootTrigger (WeakBag (Subscriber a), IORef (DMap k Identity), k a)
+data EventTrigger a = forall k. GCompare k => EventTrigger (WeakBag (Subscriber a), IORef (DMap k Identity), k a)
 
 data EventHandle a = EventHandle
-  { spiderEventHandleSubscription :: EventSubscription
-  , spiderEventHandleValue :: IORef (Maybe a)
+  { eventHandleSubscription :: EventSubscription
+  , eventHandleValue :: IORef (Maybe a)
   }
 
 instance MonadRef EventM where
@@ -2785,6 +2806,14 @@ instance MonadAtomicRef (EventM) where
 -- | The monad for actions that manipulate a Spider timeline identified by @x@
 newtype SpiderHost a = SpiderHost { unSpiderHost :: IO a }
   deriving (Functor, Applicative, MonadFix, MonadIO, MonadException, MonadAsyncException)
+
+newtype SpiderHostFrame a = SpiderHostFrame { runSpiderHostFrame :: EventM a }
+  deriving (Functor,Applicative,MonadFix,MonadIO,MonadException,MonadAsyncException)
+
+instance Monad SpiderHostFrame where
+  SpiderHostFrame x >>= f = SpiderHostFrame $ x >>= runSpiderHostFrame . f
+  SpiderHostFrame x >> SpiderHostFrame y = SpiderHostFrame $ x >> y
+  return = pure
 
 instance Monad SpiderHost where
   {-# inlinable (>>=) #-}
@@ -2806,12 +2835,12 @@ runSpiderHost (SpiderHost a) = a
 runSpiderHostForTimeline :: SpiderHost a -> SpiderTimelineEnv x -> IO a
 runSpiderHostForTimeline (SpiderHost a) _ = a
 
-newEventWithTriggerIO :: (RootTrigger a -> IO (IO ())) -> IO (Event a)
+newEventWithTriggerIO :: (EventTrigger a -> IO (IO ())) -> IO (Event a)
 newEventWithTriggerIO f = do
   es <- newFanEventWithTriggerIO $ \Refl -> f
   return $ select es Refl
 
-newFanEventWithTriggerIO :: GCompare k => (forall a. k a -> RootTrigger a -> IO (IO ())) -> IO (EventSelector k)
+newFanEventWithTriggerIO :: GCompare k => (forall a. k a -> EventTrigger a -> IO (IO ())) -> IO (EventSelector k)
 newFanEventWithTriggerIO f = do
   occRef <- newIORef DMap.empty
   subscribedRef <- newIORef DMap.empty
@@ -2878,6 +2907,12 @@ fmapCheap f = pushCheap $ pure . Just . f
 
 fforCheap :: Event a -> (a -> b) -> Event b
 fforCheap = flip fmapCheap
+
+tagCheap :: Behavior b -> Event a -> Event b
+tagCheap b = pushAlwaysCheap $ const (sample b)
+
+pushAlwaysCheap :: (a -> PushM b) -> Event a -> Event b
+pushAlwaysCheap f = pushCheap (fmap Just . f)
 
 constDyn :: a -> Dynamic a
 constDyn = pure
@@ -3084,6 +3119,7 @@ class Accumulator f where
   accumMaybe f = accumMaybeM $ \v o -> pure $ f v o
   accumMaybeM :: (MonadHold m, MonadFix m) => (a -> b -> PushM (Maybe a)) -> a -> Event b -> m (f a)
   mapAccum :: (MonadHold m, MonadFix m) => (a -> b -> (a,c)) -> a -> Event b -> m (f a, Event c)
+  mapAccum f = mapAccumMaybe $ \v o -> bimap Just Just $ f v o
   mapAccumM :: (MonadHold m, MonadFix m) => (a -> b -> PushM (a, c)) -> a -> Event b -> m (f a, Event c)
   mapAccumM f = mapAccumMaybeM $ \v o -> bimap Just Just <$> f v o
   mapAccumMaybe :: (MonadHold m, MonadFix m) => (a -> b -> (Maybe a, Maybe c)) -> a -> Event b -> m (f a, Event c)
@@ -3294,4 +3330,141 @@ instance Accumulator UniqDynamic where
           pure (unsafeJustChanged old =<< mNew, output)
     (d,out) <- mapAccumMaybeMDyn f' z e
     pure (UniqDynamic d, out)
+
+class Monad m => MonadSubscribeEvent m where
+  subscribeEvent :: Event a -> m (EventHandle a)
+
+instance MonadSubscribeEvent SpiderHost where
+  subscribeEvent = runFrame . runSpiderHostFrame . subscribeEvent
+
+instance MonadSubscribeEvent SpiderHostFrame where
+  subscribeEvent e = SpiderHostFrame $ do
+    val <- liftIO $ newIORef Nothing
+    subscription <- subscribe e $ Subscriber
+      { subscriberPropagate = \a -> do
+          liftIO $ writeIORef val $ Just a
+          scheduleClear val
+      , subscriberInvalidateHeight = const (pure ())
+      , subscriberRecalculateHeight = const (pure ())
+      }
+    pure $ EventHandle
+      { eventHandleSubscription = subscription
+      , eventHandleValue = val
+      }
+
+class Monad m => MonadReflexCreateTrigger m where
+  newEventWithTrigger :: (EventTrigger a -> IO (IO ())) -> m (Event a)
+  newFanEventWithTrigger :: GCompare k => (forall x. k x -> EventTrigger x -> IO (IO ())) -> m (EventSelector k)
+
+instance MonadReflexCreateTrigger SpiderHost where
+  newEventWithTrigger = SpiderHost . newEventWithTriggerIO
+  newFanEventWithTrigger f = SpiderHost $ do
+    es <- newFanEventWithTriggerIO f
+    pure $ EventSelector $ select es
+
+instance MonadReflexCreateTrigger SpiderHostFrame where
+  newEventWithTrigger = SpiderHostFrame . EventM . liftIO . newEventWithTriggerIO
+  newFanEventWithTrigger f = SpiderHostFrame $ EventM $ liftIO $ do
+    es <- newFanEventWithTriggerIO f
+    pure $ EventSelector $ select es
+
+class (MonadReflexCreateTrigger m, MonadSubscribeEvent m) => MonadReflexHost m where
+  fireEventsAndRead :: [DSum EventTrigger Identity] -> ReadPhase a -> m a
+  runHostFrame :: SpiderHostFrame a -> m a
+
+instance MonadReflexHost SpiderHost where
+  fireEventsAndRead es (ReadPhase a) = run es a
+  runHostFrame = runFrame . runSpiderHostFrame
+
+fireEvents :: MonadReflexHost m => [DSum EventTrigger Identity] -> m ()
+fireEvents dm = fireEventsAndRead dm $ pure ()
+
+newEventWithTriggerRef :: (MonadReflexCreateTrigger m, MonadRef m, Ref m ~ Ref IO) => m (Event a, Ref m (Maybe (EventTrigger a)))
+newEventWithTriggerRef = do
+  rt <- newRef Nothing
+  e <- newEventWithTrigger $ \t -> do
+    writeRef rt $ Just t
+    pure $ writeRef rt Nothing
+  pure (e, rt)
+
+fireEventRef :: (MonadReflexHost m, MonadRef m, Ref m ~ Ref IO) => Ref m (Maybe (EventTrigger a)) -> a -> m ()
+fireEventRef mtRef input = readRef mtRef >>= \case
+  Nothing -> pure ()
+  Just trigger -> fireEvents [trigger :=> Identity input]  
+
+fireEventRefAndRead :: (MonadReflexHost m, MonadRef m, Ref m ~ Ref IO) => Ref m (Maybe (EventTrigger a)) -> a -> EventHandle b -> m (Maybe b)
+fireEventRefAndRead mtRef input e = readRef mtRef >>= \case
+  Nothing -> pure Nothing -- since we aren't firing the input, the output can't fire
+  Just trigger -> fireEventsAndRead [trigger :=> Identity input] $ readEvent e >>= \case
+    Nothing -> pure Nothing
+    Just getValue -> fmap Just getValue
+
+newtype ReadPhase a = ReadPhase (EventM a)
+  deriving (Functor,Applicative,Monad,MonadFix,MonadHold,MonadSample)
+
+{-# noinline readEvent #-}
+readEvent :: EventHandle a -> ReadPhase (Maybe (ReadPhase a))
+readEvent h = ReadPhase $ fmap (fmap pure) $ liftIO $ do
+  result <- readIORef $ eventHandleValue h
+  touch h
+  pure result
+
+class Monad m => NotReady m where
+  notReadyUntil :: Event a -> m ()
+  notReady :: m ()
+
+class Monad m => Adjustable m where
+  runWithReplace ::
+       m a
+    -> Event (m b)
+    -> m (a, Event b)
+  traverseIntMapWithKeyAdjust ::
+       (IntMap.Key -> v -> m v')
+    -> IntMap v
+    -> Event (PatchIntMap v)
+    -> m (IntMap v', Event (PatchIntMap v'))
+  traverseDMapWithKeyWithAdjust :: GCompare k
+    => (forall x. k x -> v x -> m (v' x))
+    -> DMap k v
+    -> Event (PatchDMap k v)
+    -> m (DMap k v', Event (PatchDMap k v'))
+  traverseDMapWithKeyWithAdjustWithMove :: GCompare k
+    => (forall x. k x -> v x -> m (v' x))
+    -> DMap k v
+    -> Event (PatchDMapWithMove k v)
+    -> m (DMap k v', Event (PatchDMapWithMove k v'))
+
+class Monad m => PostBuild m where
+  getPostBuild :: m (Event ())
+
+instance PostBuild m => PostBuild (ReaderT r m) where
+  getPostBuild = lift getPostBuild
+
+instance PostBuild m => PostBuild (StateT s m) where
+  getPostBuild = lift getPostBuild
+
+instance PostBuild m => PostBuild (StrictStateT.StateT s m) where
+  getPostBuild = lift getPostBuild
+
+networkView :: (NotReady m, Adjustable m, PostBuild m) => Dynamic (m a) -> m (Event a)
+networkView child = do
+  postBuild <- getPostBuild
+  let newChild = leftmost [updated child, tagCheap (current child) postBuild]
+  snd <$> runWithReplace notReady newChild
+
+networkHold :: (Adjustable m, MonadHold m) => m a -> Event (m a) -> m (Dynamic a)
+networkHold child0 newChild = do
+  (result0, newResult) <- runWithReplace child0 newChild
+  holdDyn result0 newResult
+
+untilReady :: (Adjustable m, PostBuild m) => m a -> m b -> m (a, Event b)
+untilReady a b = do
+  postBuild <- getPostBuild
+  runWithReplace a $ b <$ postBuild
+
+newtype PostBuildT m a = PostBuildT { unPostBuild :: ReaderT (Event ()) m a }
+  deriving (Functor,Applicative,Monad,MonadFix,MonadIO,MonadTrans,MonadException,MonadAsyncException)
+
+runPostBuildT :: PostBuildT m a -> Event () -> m a
+runPostBuildT (PostBuildT a) = runReaderT a
 
