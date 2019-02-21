@@ -62,36 +62,36 @@ module Reflex.Spider.Internal
   , pushAlways
     -- ** Combining 'Event's
   , leftmost
---  , mergeMap
---  , mergeIntMap
---  , mergeMapIncremental
---  , mergeMapIncrementalWithMove
---  , mergeIntMapIncremental
---  , coincidencePatchMap
+  , mergeMap
+  , mergeIntMap
+  , mergeMapIncremental
+  , mergeMapIncrementalWithMove
+  , mergeIntMapIncremental
+  , coincidencePatchMap
 --  , coincidencePatchMapWithMove
---  , coincidencePatchIntMap
+  , coincidencePatchIntMap
   , mergeList
   , mergeWith
---  , difference
---  , alignEventWithMaybe
+  , difference
+  , alignEventWithMaybe
 
     -- ** Breaking up 'Event's
 --  , splitE
---  , fanEither
---  , fanThese
+  , fanEither
+  , fanThese
 --  , fanMap
---  , dmapToThese
---  , EitherTag(..)
---  , eitherToDSum
---  , dsumToEither
+  , dmapToThese
+  , EitherTag(..)
+  , eitherToDSum
+  , dsumToEither
 --  , factorEvent
 --  , filterEventKey
 
     -- ** Collapsing 'Event's of 'Event's
---  , switchHold
---  , switchHoldPromptly
---  , switchHoldPromptOnly
---  , switchHoldPromptOnlyIncremental
+  , switchHold
+  , switchHoldPromptly
+  , switchHoldPromptOnly
+  , switchHoldPromptOnlyIncremental
 
     -- ** Using 'Event's to sample 'Behavior's
   , tag
@@ -173,6 +173,8 @@ module Reflex.Spider.Internal
   , 
   ) where
 
+import Data.Map (Map)
+import qualified Data.Map as Map
 import Debug.Trace (trace)
 import Control.Applicative (liftA2)
 import Control.Concurrent (MVar,withMVar,newMVar)
@@ -203,7 +205,7 @@ import Data.Foldable hiding (concat, elem, sequence_)
 import Data.Functor.Apply (Apply((<.>)))
 import Data.Functor.Bind (Bind((>>-),join))
 import Data.Functor.Constant (Constant(..))
-import Data.Functor.Misc (ComposeMaybe(..),dmapToThese,EitherTag(..),Const2(..))
+import Data.Functor.Misc (ComposeMaybe(..),dmapToThese,EitherTag(..),Const2(..),dmapToMap,mapWithFunctorToDMap,intMapWithFunctorToDMap,dmapToIntMap,mapToDMap,eitherToDSum,dsumToEither)
 import Data.Functor.Plus (Alt(..),Plus(..))
 import Data.Functor.Product (Product(..))
 import Data.FunctorMaybe (FunctorMaybe(..))
@@ -225,7 +227,7 @@ import GHC.Exts (Any)
 import GHC.IORef (IORef (..))
 import GHC.Stack (whoCreated)
 import Reflex.FastWeak (FastWeak,emptyFastWeak,getFastWeakTicket,mkFastWeakTicket,getFastWeakTicketWeak,getFastWeakTicketValue)
-import Reflex.Patch (Patch(..),PatchDMap(..),PatchDMapWithMove,unPatchDMapWithMove,applyAlways)
+import Reflex.Patch (Patch(..),PatchDMap(..),PatchDMapWithMove,unPatchDMapWithMove,applyAlways,PatchMap(..),const2PatchDMapWith,const2IntPatchDMapWith,PatchMapWithMove,const2PatchDMapWithMoveWith)
 import System.IO.Unsafe (unsafePerformIO,unsafeInterleaveIO)
 import System.Mem.Weak (Weak,mkWeakPtr,finalize,deRefWeak)
 import Unsafe.Coerce (unsafeCoerce)
@@ -2896,7 +2898,102 @@ distributeListOverDyn = distributeListOverDynWith id
 distributeListOverDynWith :: ([a] -> b) -> [Dynamic a] -> Dynamic b
 distributeListOverDynWith f = fmap (f . map (\(Const2 _ :=> Identity v) -> v) . DMap.toList) . distributeDMapOverDynPure . DMap.fromList . map (\(k,v) -> Const2 k :=> v) . zip [0 :: Int ..]
 
---difference :: Event a -> Event b -> Event a
---difference = alignEventWithMaybe $ \case { This a -> Just a; _ -> Nothing }
+alignEventWithMaybe :: (These a b -> Maybe c) -> Event a -> Event b -> Event c
+alignEventWithMaybe f ea eb = fmapMaybe (f <=< dmapToThese)
+  $ merge
+  $ DMap.fromList [LeftTag :=> ea, RightTag :=> eb]
 
+difference :: Event a -> Event b -> Event a
+difference = alignEventWithMaybe $ \case { This a -> Just a; _ -> Nothing }
+
+mergeMap :: Ord k => Map k (Event a) -> Event (Map k a)
+mergeMap = fmap dmapToMap . merge . mapWithFunctorToDMap
+
+mergeIntMap :: IntMap (Event a) -> Event (IntMap a)
+mergeIntMap = fmap dmapToIntMap . merge . intMapWithFunctorToDMap
+
+mergeMapIncremental :: Ord k => Incremental (PatchMap k (Event a)) -> Event (Map k a)
+mergeMapIncremental = fmap dmapToMap . mergeIncremental . unsafeMapIncremental mapWithFunctorToDMap (const2PatchDMapWith id)
+
+mergeIntMapIncremental :: Incremental (PatchIntMap (Event a)) -> Event (IntMap a)
+mergeIntMapIncremental = fmap dmapToIntMap . mergeIncremental . unsafeMapIncremental intMapWithFunctorToDMap (const2IntPatchDMapWith id)
+
+unsafeMapIncremental :: (Patch p, Patch p') => (PatchTarget p -> PatchTarget p') -> (p -> p') -> Incremental p -> Incremental p'
+unsafeMapIncremental f g a = unsafeBuildIncremental (fmap f $ sample $ currentIncremental a) $ g <$> updatedIncremental a
+
+mergeMapIncrementalWithMove :: Ord k => Incremental (PatchMapWithMove k (Event a)) -> Event (Map k a)
+mergeMapIncrementalWithMove = fmap dmapToMap . mergeIncrementalWithMove . unsafeMapIncremental mapWithFunctorToDMap (const2PatchDMapWithMoveWith id)
+
+fanEither :: Event (Either a b) -> (Event a, Event b)
+fanEither e =
+  let justLeft = either Just (const Nothing)
+      justRight = either (const Nothing) Just
+  in (fmapMaybe justLeft e, fmapMaybe justRight e)
+
+fanThese :: Event (These a b) -> (Event a, Event b)
+fanThese e =
+  let this = \case
+        This x -> Just x
+        These x _ -> Just x
+        _ -> Nothing
+      that = \case
+        That y -> Just y
+        These _ y -> Just y
+        _ -> Nothing
+  in (fmapMaybe this e, fmapMaybe that e)
+
+fanMap :: Ord k => Event (Map k a) -> EventSelector (Const2 k a)
+fanMap = fan . fmap mapToDMap
+
+switchHold :: MonadHold m => Event a -> Event (Event a) -> m (Event a)
+switchHold ea0 eea = switch <$> hold ea0 eea
+
+switchHoldPromptly :: MonadHold m => Event a -> Event (Event a) -> m (Event a)
+switchHoldPromptly ea0 eea = do
+  bea <- hold ea0 eea
+  let eLag = switch bea
+      eCoincidences = coincidence eea
+  pure $ leftmost [eCoincidences, eLag]
+
+switchHoldPromptOnly :: MonadHold m => Event a -> Event (Event a) -> m (Event a)
+switchHoldPromptOnly e0 e' = do
+  eLag <- switch <$> hold e0 e'
+  pure $ coincidence $ leftmost [e', eLag <$ eLag]
+
+coincidencePatchMap :: Ord k => Event (PatchMap k (Event v)) -> Event (PatchMap k v)
+coincidencePatchMap e = fmapCheap PatchMap $ coincidence $ ffor e $ \(PatchMap m) -> mergeMap $ ffor m $ \case
+  Nothing -> fmapCheap (const Nothing) e
+  Just ev -> leftmost [fmapCheap Just ev, fmapCheap (const Nothing) e]
+
+coincidencePatchIntMap :: Event (PatchIntMap (Event v)) -> Event (PatchIntMap v)
+coincidencePatchIntMap e = fmapCheap PatchIntMap $ coincidence $ ffor e $ \(PatchIntMap m) -> mergeIntMap $ ffor m $ \case
+  Nothing -> fmapCheap (const Nothing) e
+  Just ev -> leftmost [fmapCheap Just ev, fmapCheap (const Nothing) e]
+
+--coincidencePatchMapWithMove :: Ord k => Event (PatchMapWithMove k (Event v)) -> Event (PatchMapWithMove k v)
+--coincidencePatchMapWithMove e = fmapCheap unsafePatchMapWithMove $ 
+
+ffor :: Functor f => f a -> (a -> b) -> f b
+ffor = flip fmap
+
+switchHoldPromptOnlyIncremental
+  :: forall m p pt w
+  .  ( MonadHold m
+     , Patch (p (Event w))
+     , PatchTarget (p (Event w)) ~ pt (Event w)
+     , Patch (p w)
+     , PatchTarget (p w) ~ pt w
+     , Monoid (pt w)
+     )
+  => (Incremental (p (Event w)) -> Event (pt w))
+  -> (Event (p (Event w)) -> Event (p w))
+  -> pt (Event w)
+  -> Event (p (Event w))
+  -> m (Event (pt w))
+switchHoldPromptOnlyIncremental mergePatchIncremental coincidencePatch e0 e' = do
+  lag <- mergePatchIncremental <$> holdIncremental e0 e'
+  pure $ ffor (align lag (coincidencePatch e')) $ \case
+    This old -> old
+    That new -> new `applyAlways` mempty
+    These old new -> new `applyAlways` old
 
