@@ -10,6 +10,8 @@
 {-# language ScopedTypeVariables #-}
 {-# language TypeFamilies #-}
 {-# language UndecidableInstances #-}
+{-# language RecursiveDo #-}
+{-# language MagicHash #-}
 
 -- | This module is the implementation of the 'Spider' 'Reflex' engine.  It uses
 -- a graph traversal algorithm to propagate 'Event's and 'Behavior's.
@@ -68,7 +70,7 @@ module Reflex.Spider.Internal
   , mergeMapIncrementalWithMove
   , mergeIntMapIncremental
   , coincidencePatchMap
---  , coincidencePatchMapWithMove
+  , coincidencePatchMapWithMove
   , coincidencePatchIntMap
   , mergeList
   , mergeWith
@@ -76,16 +78,17 @@ module Reflex.Spider.Internal
   , alignEventWithMaybe
 
     -- ** Breaking up 'Event's
---  , splitE
+  , splitE
+  , splitF
   , fanEither
   , fanThese
---  , fanMap
+  , fanMap
   , dmapToThese
   , EitherTag(..)
   , eitherToDSum
   , dsumToEither
---  , factorEvent
---  , filterEventKey
+  , factorEvent
+  , filterEventKey
 
     -- ** Collapsing 'Event's of 'Event's
   , switchHold
@@ -103,41 +106,34 @@ module Reflex.Spider.Internal
   , gate
 
     -- ** Combining 'Dynamic's
---  , distributeDMapOverDynPure
---  , distributeListOverDyn
---  , distributeListOverDynWith
+  , distributeDMapOverDynPure
+  , distributeListOverDyn
+  , distributeListOverDynWith
   , zipDyn
   , zipDynWith
   
     -- * Accumulating state
---  , accum
---  , accumM
---  , accumMaybe
---  , accumMaybeM
---  , mapAccum
---  , mapAccumM
---  , mapAccumMaybe
---  , mapAccumMaybeM
---  , accumDyn
---  , accumMDyn
---  , accumMaybeDyn
---  , accumMaybeMDyn
---  , mapAccumDyn
---  , mapAccumMDyn
---  , mapAccumMaybeDyn
---  , mapAccumMaybeMDyn
---  , accumB
---  , accumMB
---  , accumMaybeB
---  , accumMaybeMB
---  , mapAccumB
---  , mapAccumMB
---  , mapAccumMaybeB
---  , mapAccumMaybeMB
---  , mapAccum_
---  , mapAccumM_
---  , mapAccumMaybe_
---  , mapAccumMaybeM_
+  , Accumulator(..)
+  , accumDyn
+  , accumMDyn
+  , accumMaybeDyn
+  , accumMaybeMDyn
+  , mapAccumDyn
+  , mapAccumMDyn
+  , mapAccumMaybeDyn
+  , mapAccumMaybeMDyn
+  , accumB
+  , accumMB
+  , accumMaybeB
+  , accumMaybeMB
+  , mapAccumB
+  , mapAccumMB
+  , mapAccumMaybeB
+  , mapAccumMaybeMB
+  , mapAccum_
+  , mapAccumM_
+  , mapAccumMaybe_
+  , mapAccumMaybeM_
 --  , accumIncremental
 --  , accumMIncremental
 --  , accumMaybeMIncremental
@@ -146,19 +142,19 @@ module Reflex.Spider.Internal
 --  , mapAccumMaybeIncremental
 --  , mapAccumMaybeMIncremental
 
---  , zipListWithEvent
---  , numberOccurrences
---  , numberOccurrencesFrom
---  , numberOccurrencesFrom_
---  , (<@>)
---  , (<@)
---  , tailE
---  , headTailE
---  , taileWhileE
---  , takeWhileJustE
---  , dropWhileE
---  , takeDropWhileJustE
---  , switcher
+  , zipListWithEvent
+  , numberOccurrences
+  , numberOccurrencesFrom
+  , numberOccurrencesFrom_
+  , (<@>)
+  , (<@)
+  , tailE
+  , headTailE
+  , takeWhileE
+  , takeWhileJustE
+  , dropWhileE
+  , takeDropWhileJustE
+  , switcher
     
     -- * Debugging functions
   , traceEvent
@@ -173,47 +169,47 @@ module Reflex.Spider.Internal
   , 
   ) where
 
-import Data.Map (Map)
-import qualified Data.Map as Map
-import Debug.Trace (trace)
 import Control.Applicative (liftA2)
 import Control.Concurrent (MVar,withMVar,newMVar)
 import Control.Exception (evaluate)
-import qualified Control.Monad
+import Control.Monad (when,ap,unless,void,(<=<),guard,forM_)
 import Control.Monad.Exception (MonadException(..),MonadAsyncException(..))
+import Control.Monad.Fix (MonadFix)
+import Control.Monad.IO.Class (MonadIO(liftIO))
 import Control.Monad.Identity (Identity(..))
 import Control.Monad.Primitive (touch)
 import Control.Monad.Reader (ReaderT(..),runReaderT,asks,ask)
-import Control.Monad.IO.Class (MonadIO(liftIO))
-import Control.Monad.Fix (MonadFix)
-import Control.Monad.Trans (MonadTrans(lift))
-import Control.Monad (when,ap,unless,void,(<=<))
-import Data.Foldable (foldlM)
 import Control.Monad.Ref
 import Control.Monad.State.Strict (StateT)
+import Control.Monad.Trans (MonadTrans(lift))
 import Control.Monad.Trans.Cont (ContT)
 import Control.Monad.Trans.Except (ExceptT)
 import Control.Monad.Trans.RWS (RWST)
 import Control.Monad.Trans.Writer (WriterT)
 import Data.Align (Align(..))
+import Data.Bifunctor (bimap,first)
 import Data.Coerce (Coercible,coerce)
 import Data.Default (Default(def))
 import Data.Dependent.Map (DMap, DSum (..))
 import Data.FastMutableIntMap (FastMutableIntMap, PatchIntMap (..))
 import Data.FastWeakBag (FastWeakBag)
-import Data.Foldable hiding (concat, elem, sequence_)
+import Data.Foldable (Foldable(foldl'),foldlM,for_,traverse_)
+import qualified Data.Foldable
+--import Data.Foldable hiding (concat, elem, sequence_)
+import Data.Functor (($>))
 import Data.Functor.Apply (Apply((<.>)))
 import Data.Functor.Bind (Bind((>>-),join))
+import Data.Functor.Compose (Compose(..))
 import Data.Functor.Constant (Constant(..))
 import Data.Functor.Misc (ComposeMaybe(..),dmapToThese,EitherTag(..),Const2(..),dmapToMap,mapWithFunctorToDMap,intMapWithFunctorToDMap,dmapToIntMap,mapToDMap,eitherToDSum,dsumToEither)
 import Data.Functor.Plus (Alt(..),Plus(..))
 import Data.Functor.Product (Product(..))
 import Data.FunctorMaybe (FunctorMaybe(..))
 import Data.GADT.Compare (GEq(..),GCompare(..))
-import Data.Type.Equality ((:~:)(..))
 import Data.IORef (newIORef,readIORef,writeIORef,modifyIORef',modifyIORef)
 import Data.IntMap.Strict (IntMap)
 import Data.List.NonEmpty (NonEmpty(..))
+import Data.Map (Map)
 import Data.Maybe (isJust,maybeToList,catMaybes,mapMaybe,fromMaybe)
 import Data.Proxy (Proxy(Proxy))
 import Data.Reflection (reify)
@@ -222,8 +218,10 @@ import Data.Some (Some)
 import Data.These (These(..),mergeThese)
 import Data.Traversable (forM)
 import Data.Type.Coercion (Coercion(..),coerceWith)
+import Data.Type.Equality ((:~:)(..))
 import Data.WeakBag (WeakBag, WeakBagTicket, _weakBag_children)
-import GHC.Exts (Any)
+import Debug.Trace (trace)
+import GHC.Exts (Any,reallyUnsafePtrEquality#)
 import GHC.IORef (IORef (..))
 import GHC.Stack (whoCreated)
 import Reflex.FastWeak (FastWeak,emptyFastWeak,getFastWeakTicket,mkFastWeakTicket,getFastWeakTicketWeak,getFastWeakTicketValue)
@@ -231,6 +229,7 @@ import Reflex.Patch (Patch(..),PatchDMap(..),PatchDMapWithMove,unPatchDMapWithMo
 import System.IO.Unsafe (unsafePerformIO,unsafeInterleaveIO)
 import System.Mem.Weak (Weak,mkWeakPtr,finalize,deRefWeak)
 import Unsafe.Coerce (unsafeCoerce)
+import qualified Control.Monad
 import qualified Data.Dependent.Map as DMap
 import qualified Data.FastMutableIntMap as FastMutableIntMap
 import qualified Data.FastWeakBag as FastWeakBag
@@ -238,6 +237,7 @@ import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Some as Some
 import qualified Data.WeakBag as WeakBag
 import qualified Reflex.Patch.DMapWithMove as PatchDMapWithMove
+import qualified Reflex.Patch.MapWithMove as PatchMapWithMove
 
 #ifdef DEBUG_CYCLES
 import Control.Monad.State hiding (forM, forM_, mapM, mapM_, sequence)
@@ -2560,8 +2560,13 @@ instance Applicative Dynamic where
   pure = Dynamic . dynamicConst'
   liftA2 f a b = zipDynWith f a b
   a <*> b = zipDynWith ($) a b
---  a *> b = unsafeBuildDynamic (sample $ current b) $ leftmost [updated b, tag (current b) $ updated a]
---  (<*) = flip (*>) -- There are no effects, so order doesn't matter
+  a *> b = unsafeBuildDynamic (sample $ current b) $ leftmost [updated b, tag (current b) $ updated a]
+  (<*) = flip (*>) -- There are no effects, so order doesn't matter
+
+instance Monad Dynamic where
+  return = pure
+  x >>= f = Dynamic $ dynamicDynIdentity' $ newJoinDyn $ newMapDyn (unDynamic . f) $ unDynamic x
+  (>>) = (*>)
 
 holdEventM :: a -> Event a -> EventM (Behavior a)
 holdEventM v0 e = fmap behaviorHoldIdentity $ holdE v0 $ coerce e
@@ -2612,7 +2617,7 @@ withSpiderTimeline k = do
 
 newtype PullM a = PullM (BehaviorM a) deriving (Functor, Applicative, Monad, MonadIO, MonadFix)
 
-newtype PushM a = PushM (EventM a) deriving (Functor, Applicative, Monad, MonadIO, MonadFix)
+newtype PushM a = PushM (EventM a) deriving (Functor, Applicative, Monad, MonadIO, MonadFix,MonadHold)
 
 newtype Incremental a = Incremental { unIncremental :: Dynamic' a }
 
@@ -2859,8 +2864,20 @@ mergeWithFoldCheap' f es =
   . IntMap.fromDistinctAscList
   $ zip [0 :: Int .. ] es
 
+splitF :: Functor f => f (a,b) -> (f a, f b)
+splitF e = (fmap fst e, fmap snd e)
+
+splitE :: Event (a,b) -> (Event a, Event b)
+splitE = splitF
+
+ffor :: Functor f => f a -> (a -> b) -> f b
+ffor = flip fmap
+
 fmapCheap :: (a -> b) -> Event a -> Event b
 fmapCheap f = pushCheap $ pure . Just . f
+
+fforCheap :: Event a -> (a -> b) -> Event b
+fforCheap = flip fmapCheap
 
 constDyn :: a -> Dynamic a
 constDyn = pure
@@ -2970,21 +2987,32 @@ coincidencePatchIntMap e = fmapCheap PatchIntMap $ coincidence $ ffor e $ \(Patc
   Nothing -> fmapCheap (const Nothing) e
   Just ev -> leftmost [fmapCheap Just ev, fmapCheap (const Nothing) e]
 
---coincidencePatchMapWithMove :: Ord k => Event (PatchMapWithMove k (Event v)) -> Event (PatchMapWithMove k v)
---coincidencePatchMapWithMove e = fmapCheap unsafePatchMapWithMove $ 
+coincidencePatchMapWithMove :: Ord k => Event (PatchMapWithMove k (Event v)) -> Event (PatchMapWithMove k v)
+coincidencePatchMapWithMove e = fmapCheap PatchMapWithMove.unsafePatchMapWithMove
+  $ coincidence
+  $ ffor e
+  $ \p -> mergeMap
+  $ ffor (PatchMapWithMove.unPatchMapWithMove p)
+  $ \ni -> case PatchMapWithMove._nodeInfo_from ni of
+    PatchMapWithMove.From_Delete -> fforCheap e $ const $
+      ni { PatchMapWithMove._nodeInfo_from = PatchMapWithMove.From_Delete }
+    PatchMapWithMove.From_Move k -> fforCheap e $ const $
+      ni { PatchMapWithMove._nodeInfo_from = PatchMapWithMove.From_Move k }
+    PatchMapWithMove.From_Insert ev -> leftmost
+      [ fforCheap ev $ \v ->
+          ni { PatchMapWithMove._nodeInfo_from = PatchMapWithMove.From_Insert v }
+      , fforCheap e $ const $
+          ni { PatchMapWithMove._nodeInfo_from = PatchMapWithMove.From_Delete }
+      ]
 
-ffor :: Functor f => f a -> (a -> b) -> f b
-ffor = flip fmap
-
-switchHoldPromptOnlyIncremental
-  :: forall m p pt w
-  .  ( MonadHold m
-     , Patch (p (Event w))
-     , PatchTarget (p (Event w)) ~ pt (Event w)
-     , Patch (p w)
-     , PatchTarget (p w) ~ pt w
-     , Monoid (pt w)
-     )
+switchHoldPromptOnlyIncremental :: forall m p pt w.
+  ( MonadHold m
+  , Patch (p (Event w))
+  , PatchTarget (p (Event w)) ~ pt (Event w)
+  , Patch (p w)
+  , PatchTarget (p w) ~ pt w
+  , Monoid (pt w)
+  )
   => (Incremental (p (Event w)) -> Event (pt w))
   -> (Event (p (Event w)) -> Event (p w))
   -> pt (Event w)
@@ -2996,4 +3024,274 @@ switchHoldPromptOnlyIncremental mergePatchIncremental coincidencePatch e0 e' = d
     This old -> old
     That new -> new `applyAlways` mempty
     These old new -> new `applyAlways` old
+
+takeWhileJustE :: forall m a b.
+  ( MonadFix m
+  , MonadHold m
+  )
+  => (a -> Maybe b)
+  -> Event a
+  -> m (Event b)
+takeWhileJustE f e = do
+  rec let (eBad,eTrue) = fanEither $ ffor e' $ \a -> case f a of
+            Nothing -> Left never
+            Just b -> Right b
+      eFirstBad <- headE eBad
+      e' <- switchHold e eFirstBad
+  pure eTrue
+
+filterEventKey :: forall m k v a.
+  ( MonadFix m
+  , MonadHold m
+  , GEq k
+  )
+  => k a
+  -> Event (DSum k v)
+  -> m (Event (v a))
+filterEventKey k kv' = do
+  let f :: DSum k v -> Maybe (v a)
+      f (newK :=> newV) = case newK `geq` k of
+        Just Refl -> Just newV
+        Nothing -> Nothing
+  takeWhileJustE f kv'
+ 
+factorEvent :: forall m k v a.
+  ( MonadFix m
+  , MonadHold m
+  , GEq k
+  )
+  => k a
+  -> Event (DSum k v)
+  -> m (Event (v a), Event (DSum k (Product v (Compose Event v))))
+factorEvent k0 kv' = do
+  key :: Behavior (Some k) <- hold (Some.This k0) $ fmapCheap (\(k :=> _) -> Some.This k) kv'
+  let update = flip push kv' $ \(newKey :=> newVal) -> sample key >>= \case
+        Some.This oldKey -> case newKey `geq` oldKey of
+          Just Refl -> pure Nothing
+          Nothing -> do
+            newInner <- filterEventKey newKey kv'
+            pure $ Just $ newKey :=> Pair newVal (Compose newInner)
+  eInitial <- filterEventKey k0 kv'
+  pure (eInitial,update)
+
+class Accumulator f where
+  {-# minimal (accumMaybeM, mapAccumMaybeM) #-}
+  accum :: (MonadHold m, MonadFix m) => (a -> b -> a) -> a -> Event b -> m (f a)
+  accum f = accumMaybe $ \v o -> Just $ f v o
+  accumM :: (MonadHold m, MonadFix m) => (a -> b -> PushM a) -> a -> Event b -> m (f a)
+  accumM f = accumMaybeM $ \v o -> Just <$> f v o
+  accumMaybe :: (MonadHold m, MonadFix m) => (a -> b -> Maybe a) -> a -> Event b -> m (f a)
+  accumMaybe f = accumMaybeM $ \v o -> pure $ f v o
+  accumMaybeM :: (MonadHold m, MonadFix m) => (a -> b -> PushM (Maybe a)) -> a -> Event b -> m (f a)
+  mapAccum :: (MonadHold m, MonadFix m) => (a -> b -> (a,c)) -> a -> Event b -> m (f a, Event c)
+  mapAccumM :: (MonadHold m, MonadFix m) => (a -> b -> PushM (a, c)) -> a -> Event b -> m (f a, Event c)
+  mapAccumM f = mapAccumMaybeM $ \v o -> bimap Just Just <$> f v o
+  mapAccumMaybe :: (MonadHold m, MonadFix m) => (a -> b -> (Maybe a, Maybe c)) -> a -> Event b -> m (f a, Event c)
+  mapAccumMaybe f = mapAccumMaybeM $ \v o -> pure $ f v o
+  mapAccumMaybeM :: (MonadHold m, MonadFix m) => (a -> b -> PushM (Maybe a, Maybe c)) -> a -> Event b -> m (f a, Event c)
+
+accumDyn :: (MonadHold m, MonadFix m) => (a -> b -> a) -> a -> Event b -> m (Dynamic a)
+accumDyn f = accumMaybeDyn $ \v o -> Just $ f v o
+
+accumMDyn :: (MonadHold m, MonadFix m) => (a -> b -> PushM a) -> a -> Event b -> m (Dynamic a)
+accumMDyn f = accumMaybeMDyn $ \v o -> Just <$> f v o
+
+accumMaybeDyn :: (MonadHold m, MonadFix m) => (a -> b -> Maybe a) -> a -> Event b -> m (Dynamic a)
+accumMaybeDyn f = accumMaybeMDyn $ \v o -> pure $ f v o
+
+accumMaybeMDyn :: (MonadHold m, MonadFix m) => (a -> b -> PushM (Maybe a)) -> a -> Event b -> m (Dynamic a)
+accumMaybeMDyn f z e = do
+  rec let e' = flip push e $ \o -> do
+            v <- sample $ current d'
+            f v o
+      d' <- holdDyn z e'
+  pure d'
+
+mapAccumDyn :: (MonadHold m, MonadFix m) => (a -> b -> (a,c)) -> a -> Event b -> m (Dynamic a, Event c)
+mapAccumDyn f = mapAccumMaybeDyn $ \v o -> bimap Just Just $ f v o
+
+mapAccumMDyn :: (MonadHold m, MonadFix m) => (a -> b -> PushM (a,c)) -> a -> Event b -> m (Dynamic a, Event c)
+mapAccumMDyn f = mapAccumMaybeMDyn $ \v o -> bimap Just Just <$> f v o
+
+mapAccumMaybeDyn :: (MonadHold m, MonadFix m) => (a -> b -> (Maybe a, Maybe c)) -> a -> Event b -> m (Dynamic a, Event c)
+mapAccumMaybeDyn f = mapAccumMaybeMDyn $ \v o -> pure $ f v o
+
+mapAccumMaybeMDyn :: (MonadHold m, MonadFix m) => (a -> b -> PushM (Maybe a, Maybe c)) -> a -> Event b -> m (Dynamic a, Event c)
+mapAccumMaybeMDyn f z e = do
+  rec let e' = flip push e $ \o -> do
+            v <- sample $ current d'
+            result <- f v o
+            pure $ case result of
+              (Nothing, Nothing) -> Nothing
+              _ -> Just result
+      d' <- holdDyn z $ fmapMaybe fst e'
+  pure (d', fmapMaybe snd e')
+
+accumB :: (MonadHold m, MonadFix m) => (a -> b -> a) -> a -> Event b -> m (Behavior a)
+accumB f = accumMaybeB $ \v o -> Just $ f v o
+
+accumMB :: (MonadHold m, MonadFix m) => (a -> b -> PushM a) -> a -> Event b -> m (Behavior a)
+accumMB f = accumMaybeMB $ \v o -> Just <$> f v o
+
+accumMaybeB :: (MonadHold m, MonadFix m) => (a -> b -> Maybe a) -> a -> Event b -> m (Behavior a)
+accumMaybeB f = accumMaybeMB $ \v o -> pure $ f v o
+
+accumMaybeMB :: (MonadHold m, MonadFix m) => (a -> b -> PushM (Maybe a)) -> a -> Event b -> m (Behavior a)
+accumMaybeMB f z e = do
+  rec let e' = flip push e $ \o -> do
+            v <- sample d'
+            f v o
+      d' <- hold z e'
+  pure d'
+
+mapAccumB :: (MonadHold m, MonadFix m) => (a -> b -> (a,c)) -> a -> Event b -> m (Behavior a, Event c)
+mapAccumB f = mapAccumMaybeB $ \v o -> bimap Just Just $ f v o
+
+mapAccumMB :: (MonadHold m, MonadFix m) => (a -> b -> PushM (a,c)) -> a -> Event b -> m (Behavior a, Event c)
+mapAccumMB f = mapAccumMaybeMB $ \v o -> bimap Just Just <$> f v o
+
+mapAccumMaybeB :: (MonadHold m, MonadFix m) => (a -> b -> (Maybe a, Maybe c)) -> a -> Event b -> m (Behavior a, Event c)
+mapAccumMaybeB f = mapAccumMaybeMB $ \v o -> pure $ f v o
+
+mapAccumMaybeMB :: (MonadHold m, MonadFix m) => (a -> b -> PushM (Maybe a, Maybe c)) -> a -> Event b -> m (Behavior a, Event c)
+mapAccumMaybeMB f z e = do
+  rec let e' = flip push e $ \o -> do
+            v <- sample d'
+            result <- f v o
+            pure $ case result of
+              (Nothing,Nothing) -> Nothing
+              _ -> Just result
+      d' <- hold z $ fmapMaybe fst e'
+  pure (d', fmapMaybe snd e')
+
+mapAccum_ :: (MonadHold m, MonadFix m) => (a -> b -> (a,c)) -> a -> Event b -> m (Event c)
+mapAccum_ f z e = do
+  (_, result) <- mapAccumB f z e
+  pure result
+
+mapAccumMaybe_ :: (MonadHold m, MonadFix m) => (a -> b -> (Maybe a, Maybe c)) -> a -> Event b -> m (Event c)
+mapAccumMaybe_ f z e = do
+  (_,result) <- mapAccumMaybeB f z e
+  pure result
+
+mapAccumM_ :: (MonadHold m, MonadFix m) => (a -> b -> PushM (a,c)) -> a -> Event b -> m (Event c)
+mapAccumM_ f z e = do
+  (_,result) <- mapAccumMB f z e
+  pure result
+
+mapAccumMaybeM_ :: (MonadHold m, MonadFix m) => (a -> b -> PushM (Maybe a, Maybe c)) -> a -> Event b -> m (Event c)
+mapAccumMaybeM_ f z e = do
+  (_,result) <- mapAccumMaybeMB f z e
+  pure result
+
+instance Accumulator Dynamic where
+  accumMaybeM = accumMaybeMDyn
+  mapAccumMaybeM = mapAccumMaybeMDyn
+
+instance Accumulator Behavior where
+  accumMaybeM = accumMaybeMB
+  mapAccumMaybeM = mapAccumMaybeMB
+
+instance Accumulator Event where
+  accumMaybeM f z e = updated <$> accumMaybeM f z e
+  mapAccumMaybeM f z e = first updated <$> mapAccumMaybeM f z e
+
+zipListWithEvent :: (MonadHold m, MonadFix m) => (a -> b -> c) -> [a] -> Event b -> m (Event c)
+zipListWithEvent f l e = do
+  let f' a b = case a of
+        (h:t) -> (Just t, Just $ f h b)
+        _ -> (Nothing,Nothing) -- TODO: Unsubscribe the event?
+  mapAccumMaybe_ f' l e
+
+numberOccurrences :: (MonadHold m, MonadFix m, Num b) => Event a -> m (Event (b,a))
+numberOccurrences = numberOccurrencesFrom 0
+
+numberOccurrencesFrom :: (MonadHold m, MonadFix m, Num b) => b -> Event a -> m (Event (b,a))
+numberOccurrencesFrom = mapAccum_ (\n a -> let !next = n + 1 in (next, (n, a)))
+
+numberOccurrencesFrom_ :: (MonadHold m, MonadFix m, Num b) => b -> Event a -> m (Event b)
+numberOccurrencesFrom_ = mapAccum_ (\n _ -> let !next = n + 1 in (next, n))
+
+infixl 4 <@>
+(<@>) :: Behavior (a -> b) -> Event a -> Event b
+(<@>) b = push $ \x -> do
+  f <- sample b
+  pure . Just . f $ x
+
+infixl 4 <@
+(<@) :: Behavior b -> Event a -> Event b
+(<@) = tag
+
+tailE :: MonadHold m => Event a -> m (Event a)
+tailE e = snd <$> headTailE e
+
+headTailE :: MonadHold m => Event a -> m (Event a, Event a)
+headTailE e = do
+  eHead <- headE e
+  be <- hold never $ fmap (const e) eHead
+  pure (eHead, switch be)
+
+takeWhileE :: (MonadFix m, MonadHold m) => (a -> Bool) -> Event a -> m (Event a)
+takeWhileE f = takeWhileJustE $ \v -> guard (f v) $> v
+
+takeDropWhileJustE :: (MonadFix m, MonadHold m) => (a -> Maybe b) -> Event a -> m (Event b, Event a)
+takeDropWhileJustE f e = do
+  rec let (eBad,eGood) = fanEither $ ffor e' $ \a -> case f a of
+            Nothing -> Left ()
+            Just b -> Right b
+      eFirstBad <- headE eBad
+      e' <- switchHold e (never <$ eFirstBad)
+  eRest <- switchHoldPromptOnly never (e <$ eFirstBad)
+  pure (eGood,eRest)
+
+dropWhileE :: (MonadFix m, MonadHold m) => (a -> Bool) -> Event a -> m (Event a)
+dropWhileE f e = snd <$> takeDropWhileJustE (\v -> guard (f v) $> v) e
+
+newtype UniqDynamic a = UniqDynamic { unUniqDynamic :: Dynamic a }
+
+instance Functor UniqDynamic where
+  fmap f = uniqDynamic . fmap f . unUniqDynamic
+
+instance Applicative UniqDynamic where
+  pure = UniqDynamic . constDyn
+  UniqDynamic a <*> UniqDynamic b = uniqDynamic $ a <*> b
+  _ *> b = b
+  a <* _ = a
+
+instance Monad UniqDynamic where
+  UniqDynamic x >>= f = uniqDynamic $ x >>= unUniqDynamic . f
+  _ >> b = b
+  return = pure
+
+uniqDynamic :: Dynamic a -> UniqDynamic a
+uniqDynamic d = UniqDynamic $ unsafeBuildDynamic (sample $ current d) $ flip pushCheap (updated d) $ \new -> do
+  old <- sample $ current d
+  pure $ unsafeJustChanged old new
+
+unsafePtrEq :: a -> a -> Bool
+unsafePtrEq !a !b = case reallyUnsafePtrEquality# a b of
+  0# -> False
+  _ -> True
+
+unsafeJustChanged :: a -> a -> Maybe a
+unsafeJustChanged old new = if old `unsafePtrEq` new
+  then Nothing
+  else Just new
+
+alreadyUniqDynamic :: Dynamic a -> UniqDynamic a
+alreadyUniqDynamic = UniqDynamic
+
+instance Accumulator UniqDynamic where
+  accumMaybeM f z e = do
+    let f' old change = do
+          mNew <- f old change
+          pure $ unsafeJustChanged old =<< mNew
+    d <- accumMaybeMDyn f' z e
+    pure $ UniqDynamic d
+  mapAccumMaybeM f z e = do
+    let f' old change = do
+          (mNew,output) <- f old change
+          pure (unsafeJustChanged old =<< mNew, output)
+    (d,out) <- mapAccumMaybeMDyn f' z e
+    pure (UniqDynamic d, out)
 
